@@ -1,0 +1,398 @@
+# ==============================================================================
+# 1. CONEXIÓN, EXTRACCIÓN Y CONFIGURACIÓN DE RUTAS
+# ==============================================================================
+from google.colab import drive
+import os
+import shutil
+
+print("📥 Conectando a Google Drive...")
+drive.mount('/content/drive')
+
+# Descomprimir dataset limpio sin interrupciones interactivas
+!unzip -qo "/content/drive/MyDrive/Inteligencia Artificial/Datos_Limpios.zip" -d "/content/dataset"
+
+base_dir = '/content/dataset'
+DATASET_ROOT = None
+
+# Localizador automático de la estructura jerárquica
+for root, dirs, files in os.walk(base_dir):
+    if 'train' in dirs and 'val' in dirs and 'test' in dirs:
+        DATASET_ROOT = root
+        break
+
+if DATASET_ROOT is None:
+    raise FileNotFoundError("❌ Estructura 'train/val/test' no encontrada dentro del ZIP.")
+
+print(f"✅ Dataset validado en: {DATASET_ROOT}\n")
+for split in ['train', 'val', 'test']:
+    path = os.path.join(DATASET_ROOT, split)
+    clases = sorted(os.listdir(path))
+    total_split = sum([len(os.listdir(os.path.join(path, c))) for c in clases])
+    print(f'📁 {split} ({total_split} imágenes totales):')
+    for c in clases:
+        n = len(os.listdir(os.path.join(path, c)))
+        print(f'   └─ {c}: {n} imágenes')
+    print()
+
+# ==============================================================================
+# 2. CARGA DE DATASETS Y CONFIGURACIÓN DE RENDIMIENTO
+# ==============================================================================
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, precision_score, recall_score
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+MAX_EPOCHS = 25
+
+print("⚙️ Cargando datasets a memoria RAM...")
+train_dataset = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATASET_ROOT, 'train'),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='int',
+    shuffle=True,
+    seed=42
+)
+
+val_dataset = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATASET_ROOT, 'val'),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='int',
+    shuffle=False
+)
+
+test_dataset = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATASET_ROOT, 'test'),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='int',
+    shuffle=False
+)
+
+class_names = train_dataset.class_names
+NUM_CLASSES = len(class_names)
+
+print('\n🔴 ORDEN ESTRICTO DE ETIQUETAS (Cópialo idéntico en tu app Android):')
+for i, name in enumerate(class_names):
+    print(f'  {i} ➔ {name}')
+
+# Optimización de hardware (Prefetching)
+AUTOTUNE = tf.data.AUTOTUNE
+train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
+val_dataset = val_dataset.prefetch(buffer_size=AUTOTUNE)
+test_dataset = test_dataset.prefetch(buffer_size=AUTOTUNE)
+
+# ==============================================================================
+# SECCIÓN 3 — ARQUITECTURA MEJORADA (Con Capa Oculta de Comprensión)
+# ==============================================================================
+from tensorflow.keras import layers, models, regularizers
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224, 224, 3),
+    include_top=False,
+    weights='imagenet'
+)
+base_model.trainable = True
+for layer in base_model.layers[:120]:   # Congelar hasta la capa 120
+    layer.trainable = False
+
+# Augmentación robusta en tiempo real
+data_augmentation = models.Sequential([
+    layers.RandomFlip('horizontal'),
+    layers.RandomFlip('vertical'),
+    layers.RandomRotation(0.10),
+    layers.RandomZoom(0.15),
+    layers.RandomBrightness(0.2),
+    layers.RandomContrast(0.2),
+    layers.RandomTranslation(0.05, 0.05),
+], name='augmentation_layer')
+
+inputs = tf.keras.Input(shape=(224, 224, 3))
+x = data_augmentation(inputs)
+x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.5)(x)
+
+# 🔥 NUEVA CAPA OCULTA INTERMEDIA (Interpreta y procesa los rasgos complejos)
+x = layers.Dense(
+    256,
+    activation='relu',
+    kernel_regularizer=regularizers.l2(0.001),
+    name='capa_oculta_comprension'
+)(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x) # Protección contra sobreajuste en la capa intermedia
+
+# Capa de clasificación final
+outputs = layers.Dense(
+    NUM_CLASSES,
+    activation='softmax',
+    kernel_regularizer=regularizers.l2(0.001),
+    name='capa_salida_clasificador'
+)(x)
+
+model = tf.keras.Model(inputs, outputs, name='dashcam_v2_comprension')
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.00005),  # Learning Rate bajo y seguro
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+
+# ==============================================================================
+# 4. CÁLCULO DE PESOS DE CLASE DINÁMICOS (CLASS WEIGHTS)
+# ==============================================================================
+etiquetas_train = np.concatenate([y for x, y in train_dataset], axis=0)
+conteo_por_clase = np.bincount(etiquetas_train.astype(int))
+total_muestras = np.sum(conteo_por_clase)
+
+pesos_clases = {}
+print('\n🔵 EQUILIBRIO DE FUERZAS MATEMÁTICO (Class Weights):')
+print(f"{'Clase':<25} {'Cantidad':>10} {'Factor de Peso':>15}")
+print('-' * 55)
+for i, conteo in enumerate(conteo_por_clase):
+    peso = total_muestras / (NUM_CLASSES * conteo)
+    pesos_clases[i] = peso
+    print(f"{class_names[i]:<25} {conteo:>10} {peso:>15.2f}")
+
+# ==============================================================================
+# 5. CONFIGURACIÓN DE CALLBACKS Y ENTRENAMIENTO
+# ==============================================================================
+callbacks = [
+    tf.keras.callbacks.ModelCheckpoint(
+        '/content/mejor_modelo.keras',
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7,
+        verbose=1
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=7,
+        restore_best_weights=True,
+        verbose=1
+    )
+]
+
+print('\n🚀 Iniciando entrenamiento optimizado...')
+history = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=MAX_EPOCHS,
+    class_weight=pesos_clases,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# ==============================================================================
+# 6. GRÁFICAS DE APRENDIZAJE RESILIENTES
+# ==============================================================================
+epochs_reales = len(history.history['accuracy'])
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+epoch_range = range(1, epochs_reales + 1)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle('Curvas de Aprendizaje — Dashcam IA', fontsize=14, fontweight='bold')
+
+# Panel Izquierdo: Accuracy
+axes[0].plot(epoch_range, acc, 'b-o', label='Train Accuracy', linewidth=2)
+axes[0].plot(epoch_range, val_acc, 'r-o', label='Validation Accuracy', linewidth=2)
+axes[0].fill_between(epoch_range, acc, val_acc, alpha=0.1, color='purple', label='Brecha de Overfitting')
+axes[0].set_title('Precisión (Accuracy) por Época')
+axes[0].set_xlabel('Época Real')
+axes[0].set_ylabel('Accuracy')
+axes[0].set_ylim([0, 1.05])
+axes[0].grid(True, alpha=0.3)
+
+best_epoch = np.argmax(val_acc)
+axes[0].axvline(x=best_epoch + 1, color='green', linestyle='--', alpha=0.7, label=f'Mejor Época: {best_epoch+1}')
+axes[0].annotate(f' Max\n {val_acc[best_epoch]:.3f}', xy=(best_epoch + 1, val_acc[best_epoch]), color='green')
+axes[0].legend()
+
+# Panel Derecho: Loss
+axes[1].plot(epoch_range, loss, 'b-o', label='Train Loss', linewidth=2)
+axes[1].plot(epoch_range, val_loss, 'r-o', label='Validation Loss', linewidth=2)
+axes[1].fill_between(epoch_range, loss, val_loss, alpha=0.1, color='orange')
+axes[1].set_title('Pérdida (Loss) por Época')
+axes[1].set_xlabel('Época Real')
+axes[1].set_ylabel('Loss')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('/content/curvas_aprendizaje.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f'\n🏆 Desempeño Máximo: Validated Accuracy de {max(val_acc):.4f} en la Época {best_epoch+1}')
+
+# ==============================================================================
+# 7. EVALUACIÓN AVANZADA SOBRE EL SET DE TEST (F1, PRECISION, RECALL)
+# ==============================================================================
+print('\n🔍 Evaluando de forma estricta sobre el conjunto de TEST latente...')
+y_true, y_pred_probs = [], []
+
+for images, labels in test_dataset:
+    preds = model.predict(images, verbose=0)
+    y_pred_probs.extend(preds)
+    y_true.extend(labels.numpy())
+
+y_true = np.array(y_true, dtype=int)
+y_pred_probs = np.array(y_pred_probs)
+y_pred = np.argmax(y_pred_probs, axis=1)
+
+print('\n' + '═'*60)
+print('📊 REPORTE DE MÉTRICAS MATRICIALES (SET DE TEST)')
+print('═'*60)
+print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
+
+# Matrices de Confusión
+cm = confusion_matrix(y_true, y_pred)
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+labels_cortas = ['auto_zebra', 'cruz_rojo', 'moto_casco', 'moto_sin']
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle('Matrices de Confusión Estratificadas', fontsize=14, fontweight='bold')
+
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels_cortas, yticklabels=labels_cortas, ax=axes[0])
+axes[0].set_title('Conteo Métrico Absoluto')
+axes[0].set_ylabel('Clase Real')
+axes[0].set_xlabel('Clase Predicha')
+
+sns.heatmap(cm_norm, annot=True, fmt='.2%', cmap='Greens', xticklabels=labels_cortas, yticklabels=labels_cortas, ax=axes[1])
+axes[1].set_title('Análisis Porcentual de Aciertos (Recall)')
+axes[1].set_ylabel('Clase Real')
+axes[1].set_xlabel('Clase Predicha')
+
+plt.tight_layout()
+plt.savefig('/content/confusion_matrix.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# Gráfico de barras comparativo de rendimiento
+precision_pc = precision_score(y_true, y_pred, average=None)
+recall_pc = recall_score(y_true, y_pred, average=None)
+f1_pc = f1_score(y_true, y_pred, average=None)
+
+x = np.arange(NUM_CLASSES)
+width = 0.25
+
+fig, ax = plt.subplots(figsize=(12, 5))
+b1 = ax.bar(x - width, precision_pc, width, label='Precision', color='steelblue', alpha=0.85)
+b2 = ax.bar(x, recall_pc, width, label='Recall', color='darkorange', alpha=0.85)
+b3 = ax.bar(x + width, f1_pc, width, label='F1-Score', color='mediumseagreen', alpha=0.85)
+
+for bar_group in [b1, b2, b3]:
+    for bar in bar_group:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., h + 0.01, f'{h:.2f}', ha='center', va='bottom', fontsize=8)
+
+ax.set_xticks(x)
+ax.set_xticklabels(class_names, rotation=15, ha='right')
+ax.set_ylim([0, 1.15])
+ax.set_title('Balances de Precision, Recall y F1-Score por Cada Infracción', fontsize=13, fontweight='bold')
+ax.axhline(y=0.80, color='red', linestyle='--', alpha=0.5, label='Umbral Mínimo Requerido (0.80)')
+ax.legend()
+ax.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.savefig('/content/metricas_por_clase.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# ==============================================================================
+# 8. CONVERSIÓN EXPORTABLE Y RESPALDO COMPLETO EN DRIVE (.keras y .tflite)
+# ==============================================================================
+print('\n📦 Envasando modelos para despliegue y respaldo...')
+best_model = tf.keras.models.load_model('/content/mejor_modelo.keras')
+
+# Guardar el modelo en formato Nativo Keras directamente en la ruta local para copiarlo
+keras_path = '/content/mejor_modelo_dashcam.keras'
+best_model.save(keras_path)
+
+# Conversión a TFLite
+converter = tf.lite.TFLiteConverter.from_keras_model(best_model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.target_spec.supported_types = [tf.float16]
+tflite_model = converter.convert()
+
+tflite_path = '/content/dashcam_infracciones.tflite'
+with open(tflite_path, 'wb') as f:
+    f.write(tflite_model)
+
+labels_path = '/content/labels.txt'
+with open(labels_path, 'w') as f:
+    for name in class_names:
+        f.write(name + '\n')
+
+# Envío automatizado a Google Drive (Incluyendo ahora el archivo .keras)
+drive_output = '/content/drive/MyDrive/dashcam_modelo/'
+os.makedirs(drive_output, exist_ok=True)
+
+shutil.copy(keras_path, drive_output) # <--- NUEVO: Copia el archivo pesado .keras a tu Drive
+shutil.copy(tflite_path, drive_output)
+shutil.copy(labels_path, drive_output)
+shutil.copy('/content/curvas_aprendizaje.png', drive_output)
+shutil.copy('/content/confusion_matrix.png', drive_output)
+shutil.copy('/content/metricas_por_clase.png', drive_output)
+
+print(f'✅ ¡Éxito! Archivo Keras y TFLite exportados de forma segura a Drive en: {drive_output}')
+
+# ==============================================================================
+# 9. INTERFAZ WEB DEMO DE GRADIO (VALIDACIÓN INTERACTIVA)
+# ==============================================================================
+!pip install gradio -q
+import gradio as gr
+
+UMBRAL_CONFIANZA = 0.70
+EMOJIS = {
+    'auto_sobre_zebra' : '🚗❌',
+    'cruzando_en_rojo' : '🔴🚦',
+    'moto_con_casco'   : '🏍️✅',
+    'moto_sin_casco'   : '🏍️⚠️'
+}
+
+def evaluar_imagen(imagen):
+    if imagen is None:
+        return 'Por favor, carga una imagen válida.'
+
+    img = tf.image.resize(imagen, (224, 224))
+    img = tf.expand_dims(img, 0)
+    img = tf.keras.applications.mobilenet_v2.preprocess_input(img)
+
+    preds = model.predict(img, verbose=0)[0]
+    idx_max = np.argmax(preds)
+    confianza = preds[idx_max]
+
+    resultado = {}
+    for i, name in enumerate(class_names):
+        emoji = EMOJIS.get(name, '')
+        resultado[f'{emoji} {name}'] = float(preds[i])
+
+    if confianza < UMBRAL_CONFIANZA:
+        print(f'⚠️ Alerta: Confianza baja ({confianza:.1%}) - Imagen fuera de dominio.')
+
+    return resultado
+
+interfaz = gr.Interface(
+    fn=evaluar_imagen,
+    inputs=gr.Image(label='Subir captura de Dashcam'),
+    outputs=gr.Label(num_top_classes=4, label='Nivel de Probabilidad'),
+    title='📸 Dashcam IA — Validador Avanzado de Infracciones',
+    description=f'Modelo Fine-Tuned MobileNetV2 con Capa Intermedia. Umbral de certeza: {UMBRAL_CONFIANZA:.0%}'
+)
+
+interfaz.launch(share=True)
